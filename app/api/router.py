@@ -280,6 +280,17 @@ async def list_chapters(
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
+@router.get("/documents/{doc_id}/all-chapters", response_model=List[ChapterResponse])
+async def get_all_chapters(doc_id: str):
+    """Get all chapters for a document without pagination."""
+    try:
+        chapters = await db.get_document_chapters(doc_id)
+        if not chapters:
+            raise HTTPException(status_code=404, detail="No chapters found for this document")
+        return chapters
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @router.get("/documents/{doc_id}/chapters/{chapter_id}", response_model=ChapterResponse)
 async def get_chapter(doc_id: str, chapter_id: str):
     """Get chapter details."""

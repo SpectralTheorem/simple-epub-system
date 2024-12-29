@@ -45,13 +45,23 @@ This service processes books and provides structured access to their content thr
 
 ### Chapter Management
 
-1. **List Chapters**
+1. **List Chapters (Paginated)**
    ```
    GET /document/{doc_id}/chapters?skip={skip}&limit={limit}
    ```
    - Returns paginated list of chapters for a document
+   - Includes chapter previews and metadata
 
-2. **Get Chapter Content**
+2. **Get All Chapters**
+   ```
+   GET /document/{doc_id}/all-chapters
+   ```
+   - Returns complete list of chapters for a document
+   - Includes full chapter content and metadata
+   - No pagination
+   - Useful for bulk processing or analysis
+
+3. **Get Chapter Content**
    ```
    GET /document/{doc_id}/chapter/{chapter_id}
    ```
