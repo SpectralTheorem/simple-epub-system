@@ -40,6 +40,7 @@ temp_uploads/
 *.tmp
 *.epub
 *.txt
+*.log
 
 # OS
 .DS_Store
