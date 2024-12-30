@@ -192,7 +192,10 @@ class DatabaseManager:
             async with session.begin():
                 stmt = (
                     select(DocumentModel)
-                    .options(selectinload(DocumentModel.images))
+                    .options(
+                        selectinload(DocumentModel.images),
+                        selectinload(DocumentModel.chapters)
+                    )
                     .where(DocumentModel.id == document_id)
                 )
                 result = await session.execute(stmt)
@@ -211,6 +214,16 @@ class DatabaseManager:
                                 'media_type': image.media_type
                             }
                             for image in doc.images
+                        ],
+                        'chapters': [
+                            {
+                                'id': ch.id,
+                                'title': ch.title,
+                                'order': ch.order,
+                                'level': ch.level,
+                                'parent_id': ch.parent_id
+                            }
+                            for ch in doc.chapters
                         ]
                     }
                 return None
@@ -219,9 +232,16 @@ class DatabaseManager:
         """Retrieve a chapter by ID."""
         async with self.async_session() as session:
             async with session.begin():
-                stmt = select(ChapterModel).where(
-                    ChapterModel.id == chapter_id,
-                    ChapterModel.document_id == doc_id
+                stmt = (
+                    select(ChapterModel)
+                    .options(
+                        selectinload(ChapterModel.children),
+                        selectinload(ChapterModel.images)
+                    )
+                    .where(
+                        ChapterModel.id == chapter_id,
+                        ChapterModel.document_id == doc_id
+                    )
                 )
                 result = await session.execute(stmt)
                 chapter = result.scalar_one_or_none()

@@ -60,10 +60,10 @@ async def process_document_background(file_path: str, doc_id: str):
             # Process chapters
             chapters = await processor.segment_chapters(document)
             
-            # Extract images
-            images = await processor.extract_images(document)
+            # Skip image extraction and storage
+            images = {}
             
-            # Store images
+            # Store images (skipped - empty dict)
             for img_id, img_data in images.items():
                 try:
                     await db.store_image({
@@ -147,53 +147,34 @@ async def process_document_background(file_path: str, doc_id: str):
             logging.error(f"Error cleaning up temp file: {cleanup_error}")
 
 
-def _build_chapter_hierarchy(chapters: List[Any]) -> List[ChapterHierarchy]:
+def _build_chapter_hierarchy(chapters: List[Any]) -> List[Dict[str, Any]]:
     """Build chapter hierarchy from flat chapter list."""
-    # Convert SQLAlchemy models to dicts for easier processing
-    chapter_dicts = [
-        {
-            'id': ch.id,
-            'title': ch.title,
-            'level': ch.level,
-            'order': ch.order,
-            'parent_id': ch.parent_id
+    # Create lookup table for chapters by ID
+    chapter_map = {ch['id']: ch for ch in chapters}
+    
+    # Find root chapters (no parent)
+    root_chapters = [ch for ch in chapters if not ch.get('parent_id')]
+    
+    def build_tree(chapter: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively build chapter tree."""
+        children = [
+            build_tree(chapter_map[ch['id']])
+            for ch in chapters
+            if ch.get('parent_id') == chapter['id']
+        ]
+        return {
+            'id': chapter['id'],
+            'title': chapter['title'],
+            'level': chapter['level'],
+            'order': chapter['order'],
+            'children': children
         }
-        for ch in chapters
-    ]
     
-    # Create a map of all chapters
-    chapter_map = {ch['id']: ch for ch in chapter_dicts}
-    
-    # Initialize children lists
-    for ch in chapter_dicts:
-        ch['children'] = []
-    
-    # Build hierarchy
-    roots = []
-    for ch in chapter_dicts:
-        if not ch['parent_id']:
-            roots.append(ch)
-        else:
-            parent = chapter_map.get(ch['parent_id'])
-            if parent:
-                parent['children'].append(ch)
-    
-    # Sort by order
-    roots.sort(key=lambda x: x['order'])
-    for ch in chapter_dicts:
-        ch['children'].sort(key=lambda x: x['order'])
-    
-    # Convert to ChapterHierarchy models
-    def convert_to_hierarchy(chapter_dict: Dict[str, Any]) -> ChapterHierarchy:
-        return ChapterHierarchy(
-            id=chapter_dict['id'],
-            title=chapter_dict['title'],
-            level=chapter_dict['level'],
-            order=chapter_dict['order'],
-            children=[convert_to_hierarchy(child) for child in chapter_dict['children']]
-        )
-    
-    return [convert_to_hierarchy(root) for root in roots]
+    # Build hierarchy starting from root chapters
+    hierarchy = [build_tree(ch) for ch in root_chapters]
+    # Sort by order at each level
+    hierarchy.sort(key=lambda x: x['order'])
+    return hierarchy
 
 
 @router.post("/documents/upload", response_model=APIProcessingStatus)
@@ -312,18 +293,25 @@ async def list_documents(
 @router.get("/documents/{doc_id}", response_model=DocumentResponse)
 async def get_document(doc_id: str):
     """Get document details with chapter hierarchy."""
-    document = await db.get_document(doc_id)
-    if not document:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    # Get all chapters to build hierarchy
-    chapters = await db.get_all_chapters(doc_id)
-    
-    return DocumentResponse(
-        **document,
-        chapter_count=len(chapters),
-        chapter_hierarchy=_build_chapter_hierarchy(chapters)
-    )
+    try:
+        document = await db.get_document(doc_id)
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+        
+        # Build chapter hierarchy from the chapters in document
+        chapters = document.get('chapters', [])
+        
+        return DocumentResponse.model_validate({
+            **document,
+            'chapter_count': len(chapters),
+            'chapter_hierarchy': _build_chapter_hierarchy(chapters)
+        })
+    except Exception as e:
+        logging.error(f"Error retrieving document {doc_id}: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error retrieving document: {str(e)}"
+        ) from e
 
 
 @router.get("/documents/{doc_id}/chapters", response_model=List[ChapterPreview])
@@ -349,7 +337,7 @@ async def list_chapters(
     ]
 
 
-@router.get("/documents/{doc_id}/chapters/hierarchy", response_model=List[ChapterHierarchy])
+@router.get("/documents/{doc_id}/chapters/hierarchy", response_model=List[Dict[str, Any]])
 async def get_chapter_hierarchy(doc_id: str):
     """Get the full chapter hierarchy for a document."""
     document = await db.get_document(doc_id)

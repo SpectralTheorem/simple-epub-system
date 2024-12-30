@@ -99,14 +99,31 @@ def main():
             # Get document details if processing is done
             log_output("\n=== Getting Document Details ===")
             response = requests.get(f"{base_url}/documents/{doc_id}")
-            if response.status_code == 200:
-                doc_data = response.json()
-                log_output(f"Document Details Response: {response.status_code}")
-                log_output(f"Response: {json.dumps(doc_data, indent=2)}")
-            else:
-                log_output(f"Failed to get document details: {response.status_code}")
-                log_output(f"Response: {response.json()}")
+            log_output(f"Document Details Response: {response.status_code}")
+            try:
+                doc_details = response.json()
+                log_output(f"Response: {json.dumps(doc_details, indent=2)}")
+            except json.JSONDecodeError:
+                log_output(f"Error: Could not decode JSON response")
+                log_output(f"Response Text: {response.text}")
                 
+                # Check server logs for more details
+                check_server_logs()
+                break
+            
+            # Test chapter endpoint with the first chapter
+            if doc_details.get("chapters"):
+                first_chapter = doc_details["chapters"][0]
+                chapter_id = first_chapter["id"]
+                log_output("\n=== Testing Chapter Endpoint ===")
+                response = requests.get(f"{base_url}/documents/{doc_id}/chapters/{chapter_id}")
+                log_output(f"Chapter Response: {response.status_code}")
+                if response.status_code == 200:
+                    chapter_data = response.json()
+                    log_output(f"Response: {json.dumps(chapter_data, indent=2)}")
+                else:
+                    log_output(f"Error Response: {response.text}")
+            
             # Check server logs again after failure
             if status_data.get("status") == "failed":
                 check_server_logs()
