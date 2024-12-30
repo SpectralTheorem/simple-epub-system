@@ -8,7 +8,7 @@ import nltk
 from nltk.tokenize import sent_tokenize
 
 from .base_processor import BaseDocumentProcessor
-from ..models.document import Document, Chapter, DocumentFormat
+from ..models.document import Document, Chapter, ChapterContent, DocumentFormat, ProcessingStatus
 from ..utils.text_utils import clean_text, extract_chapter_title
 
 
@@ -33,12 +33,14 @@ class PdfProcessor(BaseDocumentProcessor):
             title=info.get('/Title', file_path.stem),
             author=info.get('/Author'),
             format=DocumentFormat.PDF,
-            metadata={'page_count': len(reader.pages)}
+            doc_info={'page_count': len(reader.pages)},
+            processing_status=ProcessingStatus.PENDING,
+            file_path=file_path
         )
 
     async def extract_metadata(self, document: Document) -> Dict[str, Any]:
         """Extract detailed metadata from PDF."""
-        reader = PdfReader(document.id + '.pdf')
+        reader = PdfReader(document.file_path)
         metadata = reader.metadata
         
         return {
@@ -55,7 +57,7 @@ class PdfProcessor(BaseDocumentProcessor):
 
     async def segment_chapters(self, document: Document) -> List[Chapter]:
         """Segment PDF into chapters using heuristic approach."""
-        reader = PdfReader(document.id + '.pdf')
+        reader = PdfReader(document.file_path)
         chapters = []
         current_chapter = []
         chapter_number = 1
@@ -67,12 +69,22 @@ class PdfProcessor(BaseDocumentProcessor):
             if self._is_chapter_start(text) and current_chapter:
                 # Save previous chapter
                 chapter_title = extract_chapter_title(current_chapter[0])
+                chapter_content = ChapterContent(
+                    html="",  # PDF doesn't have HTML
+                    text="\n".join(current_chapter),
+                    footnotes=[],  # PDF footnote extraction not implemented
+                    images=[],  # Image references handled separately
+                    tables=[]  # Table extraction handled separately
+                )
+                
                 chapters.append(
                     Chapter(
                         id=f"{document.id}_ch_{chapter_number}",
+                        document_id=document.id,
                         title=chapter_title,
-                        content="\n".join(current_chapter),
-                        order=chapter_number
+                        content=chapter_content,
+                        order=chapter_number,
+                        level=0  # PDF doesn't have hierarchy information
                     )
                 )
                 chapter_number += 1
@@ -83,12 +95,22 @@ class PdfProcessor(BaseDocumentProcessor):
         # Add the last chapter
         if current_chapter:
             chapter_title = extract_chapter_title(current_chapter[0])
+            chapter_content = ChapterContent(
+                html="",
+                text="\n".join(current_chapter),
+                footnotes=[],
+                images=[],
+                tables=[]
+            )
+            
             chapters.append(
                 Chapter(
                     id=f"{document.id}_ch_{chapter_number}",
+                    document_id=document.id,
                     title=chapter_title,
-                    content="\n".join(current_chapter),
-                    order=chapter_number
+                    content=chapter_content,
+                    order=chapter_number,
+                    level=0
                 )
             )
 
@@ -96,7 +118,7 @@ class PdfProcessor(BaseDocumentProcessor):
 
     async def extract_images(self, document: Document) -> Dict[str, bytes]:
         """Extract images from PDF pages."""
-        reader = PdfReader(document.id + '.pdf')
+        reader = PdfReader(document.file_path)
         images = {}
         
         for page_num, page in enumerate(reader.pages):
@@ -107,8 +129,19 @@ class PdfProcessor(BaseDocumentProcessor):
                     if xObject[obj]['/Subtype'] == '/Image':
                         image = xObject[obj]
                         image_key = f"{document.id}_image_{page_num}_{obj}"
-                        # Extract image based on format (implementation details omitted)
-                        images[image_key] = b''  # Placeholder for actual image data
+                        # Extract image based on format
+                        try:
+                            if image['/Filter'] == '/DCTDecode':
+                                # JPEG image
+                                images[image_key] = image._data
+                            elif image['/Filter'] == '/FlateDecode':
+                                # PNG image
+                                images[image_key] = image._data
+                            elif image['/Filter'] == '/JPXDecode':
+                                # JPEG2000 image
+                                images[image_key] = image._data
+                        except Exception:
+                            continue
         
         return images
 

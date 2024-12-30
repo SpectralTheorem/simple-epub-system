@@ -39,6 +39,7 @@ ENV/
 temp_uploads/
 *.tmp
 *.epub
+*.txt
 
 # OS
 .DS_Store

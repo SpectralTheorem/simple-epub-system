@@ -1,25 +1,30 @@
 from fastapi import APIRouter, HTTPException, UploadFile, File, Query, BackgroundTasks
 from fastapi.responses import JSONResponse
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Any
 import asyncio
 from pathlib import Path
 import tempfile
 import os
 import shutil
 import logging
+import base64
 
 from ..core.epub_processor import EpubProcessor
 from ..core.pdf_processor import PdfProcessor
 from ..storage.database import DatabaseManager
-from ..utils.id_generator import generate_document_id, generate_chapter_id
-from ..models.document import Document, DocumentFormat, ProcessingStatus, Chapter
+from ..utils.id_generator import generate_document_id, generate_chapter_id, generate_image_id
+from ..models.document import (
+    Document, DocumentFormat, ProcessingStatus, Chapter,
+    ChapterHierarchy, ChapterContent
+)
 from .models import (
     DocumentResponse, ChapterResponse, ChapterPreview,
     DocumentList, SearchResult, ProcessingStatus as APIProcessingStatus, ErrorResponse
 )
 
 router = APIRouter()
-db = DatabaseManager("sqlite:///books.db")
+# Initialize database manager with aiosqlite URL
+db = DatabaseManager("sqlite+aiosqlite:///books.db")
 
 # Track background processing tasks
 processing_tasks = {}
@@ -43,93 +48,153 @@ async def process_document_background(file_path: str, doc_id: str):
         else:
             raise ValueError(f"Unsupported file format: {file_ext}")
 
-        logging.info(f"Using {doc_format} processor for document {doc_id}")
-        
-        # Process document using the actual file path
-        file_path = Path(file_path)
         try:
-            logging.info(f"Loading document from {file_path}")
-            document = await processor.load_document(file_path)
-            document.id = doc_id  # Ensure we use the generated doc_id
+            # Load document
+            document = await processor.load_document(Path(file_path))
+            document.id = doc_id
             
-            logging.info(f"Extracting metadata for document {doc_id}")
-            metadata = await processor.extract_metadata(document)
-            document.metadata = metadata
-            processing_tasks[doc_id]['progress'] = 30
-            logging.info(f"Metadata extracted: {metadata}")
+            # Extract metadata
+            doc_info = await processor.extract_metadata(document)
+            document.doc_info = doc_info
             
-            logging.info(f"Segmenting chapters for document {doc_id}")
+            # Process chapters
             chapters = await processor.segment_chapters(document)
-            document.chapters = chapters
-            processing_tasks[doc_id]['progress'] = 60
-            logging.info(f"Found {len(chapters)} chapters")
             
-            logging.info(f"Extracting images for document {doc_id}")
-            document.images = await processor.extract_images(document)
-            processing_tasks[doc_id]['progress'] = 80
+            # Extract images
+            images = await processor.extract_images(document)
             
-            logging.info(f"Extracting tables for document {doc_id}")
-            document.tables = await processor.extract_tables(document)
-            processing_tasks[doc_id]['progress'] = 90
+            # Store images
+            for img_id, img_data in images.items():
+                try:
+                    await db.store_image({
+                        'id': generate_image_id(img_id),
+                        'document_id': document.id,
+                        'content': img_data,
+                        'media_type': 'image/jpeg'  # TODO: Detect proper media type
+                    })
+                except Exception as img_error:
+                    logging.error(f"Error storing image {img_id}: {str(img_error)}")
+                    # Continue processing other images
             
-            # Update document status
-            document.processing_status = ProcessingStatus.COMPLETED
-            processing_tasks[doc_id] = {
-                'status': 'completed',
-                'progress': 100
-            }
-            
-            logging.info(f"Storing processed document {doc_id}")
-            await db.store_document(document.dict(exclude={'file_path', 'chapters', 'images', 'tables'}))
+            # Update document with processed data
+            await db.store_document({
+                'id': document.id,
+                'title': document.title,
+                'author': document.author,
+                'format': document.format.value,
+                'doc_info': document.doc_info,
+                'processing_status': ProcessingStatus.COMPLETED.value
+            })
             
             # Store chapters
-            logging.info(f"Storing {len(chapters)} chapters for document {doc_id}")
             for chapter in chapters:
-                chapter_dict = chapter.dict()
-                chapter_dict['document_id'] = doc_id
-                await db.store_chapter(chapter_dict)
+                try:
+                    # Convert Chapter object to dict
+                    chapter_dict = {
+                        'id': chapter.id,
+                        'document_id': chapter.document_id,
+                        'title': chapter.title,
+                        'content': {
+                            'html': chapter.content.html,
+                            'text': chapter.content.text,
+                            'footnotes': chapter.content.footnotes,
+                            'images': chapter.content.images,
+                            'tables': chapter.content.tables
+                        },
+                        'order': chapter.order,
+                        'level': chapter.level,
+                        'parent_id': chapter.parent_id if hasattr(chapter, 'parent_id') else None
+                    }
+                    await db.store_chapter(chapter_dict)
+                except Exception as ch_error:
+                    logging.error(f"Error storing chapter {chapter.id}: {str(ch_error)}")
+                    # Continue processing other chapters
             
-        except Exception as e:
-            error_msg = f"Processing error: {str(e)}"
-            logging.error(f"Error processing document {doc_id}: {error_msg}", exc_info=True)
-            document = Document(
-                id=doc_id,
-                title=Path(file_path).stem,
-                processing_status=ProcessingStatus.FAILED,
-                error_message=error_msg,
-                format=doc_format
-            )
             processing_tasks[doc_id] = {
-                'status': 'failed',
-                'progress': 0,
-                'error': error_msg
+                'status': 'completed',
+                'progress': 1.0
             }
-            await db.store_document(document.dict())
-            raise
+            
+            logging.info(f"Completed processing document {doc_id}")
+            
+        except Exception as proc_error:
+            error_msg = f"Error during document processing: {str(proc_error)}"
+            logging.error(error_msg, exc_info=True)
+            raise RuntimeError(error_msg) from proc_error
             
     except Exception as e:
-        error_msg = f"Background task error: {str(e)}"
-        logging.error(f"Error in background task for document {doc_id}: {error_msg}", exc_info=True)
+        error_msg = f"Error processing document {doc_id}: {str(e)}"
+        logging.error(error_msg, exc_info=True)
         processing_tasks[doc_id] = {
             'status': 'failed',
             'progress': 0,
             'error': error_msg
         }
-        await db.store_document({
-            'id': doc_id,
-            'title': Path(file_path).stem,
-            'processing_status': ProcessingStatus.FAILED.value,
-            'error_message': error_msg,
-            'format': doc_format.value if 'doc_format' in locals() else DocumentFormat.EPUB.value
-        })
-    finally:
-        # Clean up temporary file
         try:
-            if Path(file_path).exists():
-                Path(file_path).unlink()
-                logging.info(f"Cleaned up temporary file {file_path}")
-        except Exception as e:
-            logging.error(f"Error cleaning up temporary file: {e}")
+            await db.store_document({
+                'id': doc_id,
+                'processing_status': ProcessingStatus.FAILED.value,
+                'doc_info': {'error': error_msg}
+            })
+        except Exception as db_error:
+            logging.error(f"Error updating document status: {str(db_error)}")
+    finally:
+        # Clean up temp file
+        try:
+            os.remove(file_path)
+            logging.info(f"Cleaned up temp file {file_path}")
+        except Exception as cleanup_error:
+            logging.error(f"Error cleaning up temp file: {cleanup_error}")
+
+
+def _build_chapter_hierarchy(chapters: List[Any]) -> List[ChapterHierarchy]:
+    """Build chapter hierarchy from flat chapter list."""
+    # Convert SQLAlchemy models to dicts for easier processing
+    chapter_dicts = [
+        {
+            'id': ch.id,
+            'title': ch.title,
+            'level': ch.level,
+            'order': ch.order,
+            'parent_id': ch.parent_id
+        }
+        for ch in chapters
+    ]
+    
+    # Create a map of all chapters
+    chapter_map = {ch['id']: ch for ch in chapter_dicts}
+    
+    # Initialize children lists
+    for ch in chapter_dicts:
+        ch['children'] = []
+    
+    # Build hierarchy
+    roots = []
+    for ch in chapter_dicts:
+        if not ch['parent_id']:
+            roots.append(ch)
+        else:
+            parent = chapter_map.get(ch['parent_id'])
+            if parent:
+                parent['children'].append(ch)
+    
+    # Sort by order
+    roots.sort(key=lambda x: x['order'])
+    for ch in chapter_dicts:
+        ch['children'].sort(key=lambda x: x['order'])
+    
+    # Convert to ChapterHierarchy models
+    def convert_to_hierarchy(chapter_dict: Dict[str, Any]) -> ChapterHierarchy:
+        return ChapterHierarchy(
+            id=chapter_dict['id'],
+            title=chapter_dict['title'],
+            level=chapter_dict['level'],
+            order=chapter_dict['order'],
+            children=[convert_to_hierarchy(child) for child in chapter_dict['children']]
+        )
+    
+    return [convert_to_hierarchy(root) for root in roots]
+
 
 @router.post("/documents/upload", response_model=APIProcessingStatus)
 async def upload_document(
@@ -143,7 +208,6 @@ async def upload_document(
         # Generate document ID and create temp file path
         doc_id = generate_document_id(Path(file.filename).stem)
         temp_file_path = TEMP_DIR / f"{doc_id}{Path(file.filename).suffix}"
-        logging.info(f"Generated doc_id: {doc_id}, temp path: {temp_file_path}")
         
         # Determine document format
         file_ext = Path(file.filename).suffix.lower()
@@ -158,11 +222,9 @@ async def upload_document(
             )
         
         # Save uploaded file
-        logging.info(f"Saving uploaded file to {temp_file_path}")
         with open(temp_file_path, "wb") as buffer:
             content = await file.read()
             buffer.write(content)
-            logging.info(f"File saved successfully, size: {len(content)} bytes")
         
         # Initialize processing status
         processing_tasks[doc_id] = {
@@ -175,11 +237,11 @@ async def upload_document(
             'id': doc_id,
             'title': Path(file.filename).stem,
             'processing_status': ProcessingStatus.PROCESSING.value,
-            'format': doc_format.value
+            'format': doc_format.value,
+            'doc_info': {}
         })
         
         # Start background processing
-        logging.info(f"Starting background processing for document {doc_id}")
         background_tasks.add_task(
             process_document_background,
             str(temp_file_path),
@@ -197,23 +259,25 @@ async def upload_document(
         if 'temp_file_path' in locals():
             try:
                 os.remove(temp_file_path)
-                logging.info(f"Cleaned up temp file {temp_file_path}")
-            except Exception as cleanup_error:
-                logging.error(f"Error cleaning up temp file: {cleanup_error}")
+            except Exception:
+                pass
         raise HTTPException(status_code=400, detail=str(e))
+
 
 @router.get("/documents/{doc_id}/status", response_model=APIProcessingStatus)
 async def get_processing_status(doc_id: str):
     """Get document processing status."""
-    if doc_id not in processing_tasks:
-        raise HTTPException(status_code=404, detail="Document not found")
-    
-    task = processing_tasks[doc_id]
-    return APIProcessingStatus(
-        status=task['status'],
-        progress=task['progress'],
-        message=task.get('error')
-    )
+    task_status = processing_tasks.get(doc_id)
+    if not task_status:
+        document = await db.get_document(doc_id)
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+        return APIProcessingStatus(
+            status=document['processing_status'],
+            progress=1.0 if document['processing_status'] == ProcessingStatus.COMPLETED.value else 0
+        )
+    return APIProcessingStatus(**task_status)
+
 
 @router.get("/documents", response_model=DocumentList)
 async def list_documents(
@@ -221,41 +285,46 @@ async def list_documents(
     limit: int = Query(10, ge=1, le=100)
 ):
     """List all processed documents with pagination."""
-    try:
-        documents = await db.get_documents(skip, limit)
-        total = await db.get_document_count()
+    # Get documents
+    docs = await db.get_documents(skip=skip, limit=limit)
+    total = await db.get_document_count()
+    
+    # Convert to response format
+    doc_responses = []
+    for doc in docs:
+        # Get chapter count
+        chapter_count = await db.get_chapter_count(doc['id'])
         
-        # Convert raw dictionaries to Pydantic models
-        document_responses = [
-            DocumentResponse(
-                id=doc['id'],
-                title=doc['title'],
-                author=doc['author'],
-                format=doc['format'],
-                doc_metadata=doc.get('doc_metadata'),
-                processing_status=doc['processing_status'],
-                error_message=doc.get('error_message'),
-                created_at=doc['created_at'],
-                updated_at=doc['updated_at'],
-                chapter_count=doc['chapter_count']
-            )
-            for doc in documents
-        ]
-        
-        return DocumentList(total=total, documents=document_responses)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Create response object
+        doc_response = DocumentResponse(
+            **doc,
+            chapter_count=chapter_count,
+            chapter_hierarchy=[]  # Empty hierarchy for list view
+        )
+        doc_responses.append(doc_response)
+    
+    return DocumentList(
+        total=total,
+        documents=doc_responses
+    )
+
 
 @router.get("/documents/{doc_id}", response_model=DocumentResponse)
 async def get_document(doc_id: str):
-    """Get document details."""
-    try:
-        document = await db.get_document(doc_id)
-        if not document:
-            raise HTTPException(status_code=404, detail="Document not found")
-        return document
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Get document details with chapter hierarchy."""
+    document = await db.get_document(doc_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+    
+    # Get all chapters to build hierarchy
+    chapters = await db.get_all_chapters(doc_id)
+    
+    return DocumentResponse(
+        **document,
+        chapter_count=len(chapters),
+        chapter_hierarchy=_build_chapter_hierarchy(chapters)
+    )
+
 
 @router.get("/documents/{doc_id}/chapters", response_model=List[ChapterPreview])
 async def list_chapters(
@@ -264,43 +333,41 @@ async def list_chapters(
     limit: int = Query(10, ge=1, le=100)
 ):
     """List chapters for a document with pagination."""
-    try:
-        chapters = await db.get_document_chapters(doc_id)
-        previews = []
-        for chapter in chapters[skip:skip + limit]:
-            content = chapter['content']
-            previews.append(ChapterPreview(
-                id=chapter['id'],
-                title=chapter['title'],
-                order=chapter['order'],
-                preview=content[:200] + "..." if len(content) > 200 else content,
-                content_length=len(content)
-            ))
-        return previews
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    document = await db.get_document(doc_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+        
+    chapters = await db.get_chapters(doc_id, skip, limit)
+    return [
+        ChapterPreview(
+            id=ch['id'],
+            title=ch['title'],
+            order=ch['order'],
+            level=ch['level']
+        )
+        for ch in chapters
+    ]
 
-@router.get("/documents/{doc_id}/all-chapters", response_model=List[ChapterResponse])
-async def get_all_chapters(doc_id: str):
-    """Get all chapters for a document without pagination."""
-    try:
-        chapters = await db.get_document_chapters(doc_id)
-        if not chapters:
-            raise HTTPException(status_code=404, detail="No chapters found for this document")
-        return chapters
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+
+@router.get("/documents/{doc_id}/chapters/hierarchy", response_model=List[ChapterHierarchy])
+async def get_chapter_hierarchy(doc_id: str):
+    """Get the full chapter hierarchy for a document."""
+    document = await db.get_document(doc_id)
+    if not document:
+        raise HTTPException(status_code=404, detail="Document not found")
+        
+    chapters = await db.get_all_chapters(doc_id)
+    return _build_chapter_hierarchy(chapters)
+
 
 @router.get("/documents/{doc_id}/chapters/{chapter_id}", response_model=ChapterResponse)
 async def get_chapter(doc_id: str, chapter_id: str):
     """Get chapter details."""
-    try:
-        chapter = await db.get_chapter(chapter_id)
-        if not chapter or chapter['document_id'] != doc_id:
-            raise HTTPException(status_code=404, detail="Chapter not found")
-        return chapter
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    chapter = await db.get_chapter(doc_id, chapter_id)
+    if not chapter:
+        raise HTTPException(status_code=404, detail="Chapter not found")
+    return ChapterResponse(**chapter)
+
 
 @router.get("/search", response_model=List[SearchResult])
 async def search_content(
@@ -309,30 +376,48 @@ async def search_content(
     skip: int = Query(0, ge=0),
     limit: int = Query(10, ge=1, le=100)
 ):
-    """Search through document content."""
-    try:
-        results = await db.search_content(query, doc_id, skip, limit)
-        return [
-            SearchResult(
-                chapter_id=r['chapter_id'],
-                document_id=r['document_id'],
-                document_title=r['document_title'],
-                chapter_title=r['chapter_title'],
-                chapter_order=r['chapter_order'],
-                snippet=r['snippet']
-            )
-            for r in results
-        ]
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    """Search through document content with context."""
+    results = []
+    
+    # Get documents to search
+    if doc_id:
+        document = await db.get_document(doc_id)
+        if not document:
+            raise HTTPException(status_code=404, detail="Document not found")
+        documents = [document]
+    else:
+        documents = await db.get_documents(0, 1000)  # Reasonable limit for search
+    
+    # Search through each document's chapters
+    for document in documents:
+        chapters = await db.get_all_chapters(document['id'])
+        for chapter in chapters:
+            if query.lower() in chapter['content']['text'].lower():
+                # Create snippet with context
+                text = chapter['content']['text']
+                idx = text.lower().find(query.lower())
+                start = max(0, idx - 50)
+                end = min(len(text), idx + len(query) + 50)
+                snippet = f"...{text[start:end]}..."
+                
+                results.append(SearchResult(
+                    chapter_id=chapter['id'],
+                    document_id=document['id'],
+                    document_title=document['title'],
+                    chapter_title=chapter['title'],
+                    chapter_order=chapter['order'],
+                    chapter_level=chapter['level'],
+                    snippet=snippet,
+                    context_html=chapter['content']['html']
+                ))
+    
+    # Apply pagination
+    return results[skip:skip + limit]
 
-@router.delete("/database/clear", response_model=Dict[str, int])
+
+@router.delete("/database/clear", response_model=Dict[str, Any])
 async def clear_database():
     """Clear all entries from the database."""
-    try:
-        result = await db.clear_database()
-        # Also clear processing tasks
-        processing_tasks.clear()
-        return result
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+    result = await db.clear_database()
+    processing_tasks.clear()
+    return {"status": "Database cleared", "deleted": result}

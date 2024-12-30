@@ -3,6 +3,8 @@ import re
 from datetime import datetime
 import base64
 import uuid
+import random
+import string
 
 def generate_document_id(title: str) -> str:
     """Generate a unique, URL-safe document ID.
@@ -33,3 +35,13 @@ def generate_chapter_id(document_id: str, order: int) -> str:
     Example: doc_20241228_nixonland_abc123_ch1
     """
     return f"{document_id}_ch{order}"
+
+def generate_image_id(image_name: str) -> str:
+    """Generate a unique ID for an image."""
+    prefix = "img"
+    timestamp = datetime.now().strftime("%Y%m%d")
+    # Clean and truncate image name
+    clean_name = re.sub(r'[^a-zA-Z0-9]', '_', image_name)[:30]
+    # Generate random suffix
+    suffix = ''.join(random.choices(string.ascii_lowercase + string.digits, k=6))
+    return f"{prefix}_{timestamp}_{clean_name}_{suffix}"

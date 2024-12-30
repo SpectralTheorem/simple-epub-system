@@ -52,14 +52,16 @@ class BaseDocumentProcessor(ABC):
 
             # Wait for all tasks to complete
             try:
-                document.metadata = await metadata_task
+                metadata = await metadata_task
+                if not isinstance(metadata, dict):
+                    raise ValueError("Metadata must be a dictionary")
+                document.doc_info = metadata
                 document.chapters = await chapters_task
                 document.images = await images_task
                 document.tables = await tables_task
             except Exception as task_error:
                 document.processing_status = ProcessingStatus.FAILED
-                document.error_message = f"Processing failed during task execution: {str(task_error)}"
-                return document
+                raise Exception(f"Processing failed during task execution: {str(task_error)}")
 
             document.processing_status = ProcessingStatus.COMPLETED
             return document
@@ -67,8 +69,6 @@ class BaseDocumentProcessor(ABC):
         except Exception as e:
             if 'document' in locals():
                 document.processing_status = ProcessingStatus.FAILED
-                document.error_message = f"Processing failed during initialization: {str(e)}"
-                return document
             raise Exception(f"Failed to process document: {str(e)}")
 
     def _assign_content_to_chapters(
@@ -79,8 +79,4 @@ class BaseDocumentProcessor(ABC):
     ) -> None:
         """Assign extracted images and tables to their respective chapters."""
         # Implementation depends on specific document format
-        pass
-
-    async def cleanup(self) -> None:
-        """Clean up any temporary resources."""
         pass

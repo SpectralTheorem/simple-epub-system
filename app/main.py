@@ -51,6 +51,13 @@ app.add_middleware(
 # Include API routes
 app.include_router(router, prefix="/api/v1")
 
+@app.on_event("startup")
+async def startup_event():
+    """Initialize the database on startup."""
+    from .api.router import db
+    await db.init_db()
+    logger.info("Database initialized")
+
 @app.get("/")
 async def root():
     return {
